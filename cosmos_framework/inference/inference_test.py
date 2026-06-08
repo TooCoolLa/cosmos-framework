@@ -349,3 +349,49 @@ def test_reasoner_defaults_validate_against_overrides() -> None:
     filtered = {k: v for k, v in defaults.items() if k in OmniSampleOverrides.model_fields}
     assert set(defaults) - set(filtered) == set(), f"defaults has unknown fields: {set(defaults) - set(filtered)}"
     OmniSampleOverrides.model_validate(filtered)
+
+
+# ---------------------------------------------------------------------------
+# _get_reasoner_sample_data: image / video / text-only routing
+# ---------------------------------------------------------------------------
+
+
+def _fake_sa(vision_path: Any, **video_kw: Any) -> SimpleNamespace:
+    base: dict[str, Any] = dict(
+        prompt="describe",
+        vision_path=vision_path,
+        video_fps=None,
+        video_num_frames=None,
+        video_min_frames=None,
+        video_max_frames=None,
+        video_min_pixels=None,
+        video_max_pixels=None,
+    )
+    base.update(video_kw)
+    return SimpleNamespace(**base)
+
+
+_fake_model = SimpleNamespace(input_caption_key="caption")
+
+
+@pytest.mark.L0
+def test_reasoner_sample_data_text_only() -> None:
+    from cosmos_framework.inference.inference import _get_reasoner_sample_data
+
+    out = _get_reasoner_sample_data(_fake_sa(None), _fake_model)
+    assert out["caption"] == ["describe"]
+    assert out["reasoner_images"] == [None]
+    assert "reasoner_videos" not in out
+
+
+@pytest.mark.L0
+def test_reasoner_sample_data_video_routes_to_videos(tmp_path: Path) -> None:
+    from cosmos_framework.inference.inference import _get_reasoner_sample_data
+
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\x00")  # not decoded by the builder
+    out = _get_reasoner_sample_data(_fake_sa(str(clip), video_fps=2), _fake_model)
+    assert out["caption"] == ["describe"]
+    assert out["reasoner_videos"] == [str(clip)]
+    assert out["reasoner_images"] == [None]
+    assert out["video_sampling_kwargs"] == {"fps": 2}

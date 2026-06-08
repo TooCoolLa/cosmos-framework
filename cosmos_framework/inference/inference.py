@@ -19,6 +19,8 @@ from torch.utils._pytree import tree_map_only
 from torch.utils.data import Dataset
 from typing_extensions import Self
 
+from cosmos_framework.configs.base.defaults.compile import CompileConfig
+from cosmos_framework.configs.base.defaults.parallelism import ParallelismConfig
 from cosmos_framework.inference.args import (
     ModelMode,
     NegativeMetadataMode,
@@ -26,6 +28,7 @@ from cosmos_framework.inference.args import (
     OmniSetupArgs,
 )
 from cosmos_framework.inference.common.args import (
+    VIDEO_EXTENSIONS,
     CheckpointType,
     ConfigFileType,
     ParallelismArgs,
@@ -46,13 +49,11 @@ from cosmos_framework.inference.vision import (
     pil_to_conditioning_frames,
     resize_pil_image,
 )
-from cosmos_framework.utils import log
-from cosmos_framework.tools.visualize.video import save_img_or_video
-from cosmos_framework.configs.base.defaults.compile import CompileConfig
-from cosmos_framework.configs.base.defaults.parallelism import ParallelismConfig
 from cosmos_framework.model.vfm.omni_mot_model import OmniMoTModel
-from cosmos_framework.model.vfm.vlm.qwen3_vl.utils import _SYSTEM_PROMPT_IMAGE_EDITING
 from cosmos_framework.model.vfm.upsampler.prompts import is_upsampled_prompt
+from cosmos_framework.model.vfm.vlm.qwen3_vl.utils import _SYSTEM_PROMPT_IMAGE_EDITING
+from cosmos_framework.tools.visualize.video import save_img_or_video
+from cosmos_framework.utils import log
 
 if TYPE_CHECKING:
     from cosmos_framework.configs.base.defaults.model_config import OmniMoTModelConfig
@@ -464,14 +465,33 @@ def _get_prompt_sample_data(sample_args: OmniSampleArgs, model: OmniMoTModel, *,
 
 
 def _get_reasoner_sample_data(sample_args: OmniSampleArgs, model: OmniMoTModel) -> dict[str, Any]:
-    """Sample batch for reasoner text generation: prompt + optional conditioning image."""
+    """Sample batch for reasoner text generation: prompt + optional conditioning image or video."""
     image: Image.Image | None = None
+    video: str | None = None
     if sample_args.vision_path is not None:
-        image = Image.open(sample_args.vision_path).convert("RGB")
-    return {
+        if Path(sample_args.vision_path).suffix.lower() in VIDEO_EXTENSIONS:
+            video = str(sample_args.vision_path)
+        else:
+            image = Image.open(sample_args.vision_path).convert("RGB")
+    out: dict[str, Any] = {
         model.input_caption_key: [sample_args.prompt],
         "reasoner_images": [image],
     }
+    if video is not None:
+        out["reasoner_videos"] = [video]
+        out["video_sampling_kwargs"] = {
+            k: v
+            for k, v in {
+                "fps": sample_args.video_fps,
+                "num_frames": sample_args.video_num_frames,
+                "min_frames": sample_args.video_min_frames,
+                "max_frames": sample_args.video_max_frames,
+                "min_pixels": sample_args.video_min_pixels,
+                "max_pixels": sample_args.video_max_pixels,
+            }.items()
+            if v is not None
+        }
+    return out
 
 
 def _get_image_edit_sample_data(
@@ -1655,13 +1675,29 @@ class OmniInference(Inference):
 
         prompts: list[str] = data_batch[self.model.input_caption_key]
         raw_images: list[Image.Image | None] = data_batch["reasoner_images"]
-        n_set = sum(img is not None for img in raw_images)
-        if 0 < n_set < len(raw_images):
+        raw_videos: list[str | None] | None = data_batch.get("reasoner_videos")
+        video_sampling_kwargs: dict[str, Any] = data_batch.get("video_sampling_kwargs", {})
+
+        n_img = sum(img is not None for img in raw_images)
+        n_vid = sum(v is not None for v in (raw_videos or []))
+        if n_img and n_vid:
+            raise ValueError(
+                "Reasoner batch mixes image- and video-conditioned samples. Split into separate batches."
+            )
+        if 0 < n_img < len(raw_images):
             raise ValueError(
                 "Reasoner batch mixes image-conditioned and text-only samples "
-                f"({n_set}/{len(raw_images)} have vision_path). Split into separate batches."
+                f"({n_img}/{len(raw_images)} have an image vision_path). Split into separate batches."
             )
-        images: list[Image.Image] | None = cast(list[Image.Image], raw_images) if n_set == len(raw_images) else None
+        if raw_videos is not None and 0 < n_vid < len(raw_videos):
+            raise ValueError(
+                "Reasoner batch mixes video-conditioned and text-only samples "
+                f"({n_vid}/{len(raw_videos)} have a video vision_path). Split into separate batches."
+            )
+        images: list[Image.Image] | None = cast(list[Image.Image], raw_images) if n_img == len(raw_images) else None
+        videos: list[str] | None = (
+            cast(list[str], raw_videos) if raw_videos is not None and n_vid == len(raw_videos) else None
+        )
 
         try:
             with sync_distributed_errors():
@@ -1686,6 +1722,8 @@ class OmniInference(Inference):
                 prompts,
                 max_new_tokens=sample_args_list[0].max_new_tokens,
                 images=images,
+                videos=videos,
+                video_sampling_kwargs=video_sampling_kwargs or None,
                 do_sample=sample_args_list[0].do_sample,
                 temperature=sample_args_list[0].temperature,
                 top_k=sample_args_list[0].top_k,
