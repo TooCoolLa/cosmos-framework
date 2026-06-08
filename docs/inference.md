@@ -19,6 +19,7 @@ ______________________________________________________________________
 - [Sample Arguments](#sample-arguments)
   - [Text](#text)
   - [Vision (Image/Video)](#vision-imagevideo)
+  - [Reasoner](#reasoner)
   - [Action](#action)
   - [Custom Defaults](#custom-defaults)
 - [Guardrails](#guardrails)
