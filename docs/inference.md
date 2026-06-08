@@ -196,6 +196,17 @@ Generation arguments:
 
 Outputs `vision.jpg` or `vision.mp4` depending on `num_frames`.
 
+### Reasoner
+
+For `model_mode=reasoner`, `vision_path` may point to an **image** (`.jpg`/`.png`/…) or a **video** (`.mp4`). A video is decoded by the Qwen3-VL processor and sampled into frames. Optional frame-sampling controls (all default to the processor's defaults):
+
+- `video_fps`: frames sampled per second (mutually exclusive with `video_num_frames`).
+- `video_num_frames`: fixed number of frames to sample.
+- `video_min_frames` / `video_max_frames`: bounds on the sampled frame count.
+- `video_min_pixels` / `video_max_pixels`: per-frame pixel budget (drives resolution).
+
+Example: [`inputs/reasoner/reasoner_video.json`](../inputs/reasoner/reasoner_video.json).
+
 ### Action
 
 Common arguments:
