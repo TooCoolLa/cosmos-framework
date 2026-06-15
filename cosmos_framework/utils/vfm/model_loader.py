@@ -194,6 +194,9 @@ def _load_model(
     start_time = time.time()
 
     state_dict = ModelWrapper(model).state_dict()
+    if any(key.startswith("net_teacher.") for key in state_dict):
+        log.info("Dropping net_teacher.* keys from inference load target; distillation checkpoints do not save them.")
+        state_dict = {key: value for key, value in state_dict.items() if not key.startswith("net_teacher.")}
 
     if checkpoint_path.startswith("s3://"):
         storage_reader = S3StorageReader(
@@ -351,6 +354,9 @@ def load_model_from_checkpoint(
 
     # Disable EMA for inference.
     config.model.config.ema.enabled = False
+    if hasattr(config.model.config, "load_teacher_weights"):
+        log.info("Setting load_teacher_weights=False for inference to skip teacher checkpoint download.")
+        config.model.config.load_teacher_weights = False
 
     config.validate()
     config.freeze()  # type: ignore

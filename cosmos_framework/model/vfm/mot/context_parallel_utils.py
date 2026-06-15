@@ -237,7 +237,7 @@ def gather_seq_scatter_heads(
         x: shape of [z, seq, h, ...]
         seq_dim: the dimension to gather
         head_dim: the dimension to scatter
-        cp_mesh: ulysses sequence parallelism size
+        cp_mesh: sequence-sharded context-parallel mesh
     Returns:
         torch.Tensor: shape of gathered and scattered tensor
     """
@@ -260,7 +260,7 @@ def gather_heads_scatter_seq(
         x (torch.Tensor): shape of [bsz, seq, h/n, ...]
         head_dim (int): the dimension to gather
         seq_dim (int): the dimension to scatter
-        cp_mesh (DeviceMesh): ulysses sequence parallelism size
+        cp_mesh (DeviceMesh): sequence-sharded context-parallel mesh
         splits (List[torch.Tensor], optional): Manual splits for variable length scattering
 
     Returns:

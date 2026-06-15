@@ -237,6 +237,7 @@ class OmniMoTModel(ImaginaireModel):
             parallel_dims=self.parallel_dims,
             compile_config=self.config.compile,
             ac_config=self.config.activation_checkpointing,
+            attention_io_layout=self.config.parallelism.attention_io_layout,
         )
 
         with misc.timer("meta to cuda and broadcast model states"):
@@ -2485,12 +2486,14 @@ class OmniMoTModel(ImaginaireModel):
         # Run sampler for all samples at once.
         sampler = sampler or self.sampler
         scheduler_type = self.config.rectified_flow_inference_config.scheduler_type
-        if scheduler_type == "unipc":
+        if isinstance(sampler, FixedStepSampler):
+            log.info(f"Using sampler: FixedStep (t_list={sampler.t_list}, sample_type={sampler.sample_type})")
+        elif scheduler_type == "unipc":
             log.info(f"Using sampler: UniPC (shift={shift}, num_steps={num_steps})")
         else:
             log.info(f"Using sampler: EDM (sigma_max={sigma_max}, num_steps={num_steps})")
 
-        if scheduler_type == "unipc":
+        if isinstance(sampler, FixedStepSampler) or scheduler_type == "unipc":
             latents = sampler(
                 velocity_fn,
                 initial_noise,

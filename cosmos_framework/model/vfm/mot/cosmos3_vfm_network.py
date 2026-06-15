@@ -124,6 +124,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         self.num_kv_heads = text_config.num_key_value_heads
         self.head_dim = text_config.head_dim
         self.num_hidden_layers = text_config.num_hidden_layers
+        self.attention_io_layout = "sequence_sharded"
         self.predict_text_tokens = config.predict_text_tokens
 
         if config.natten_parameter_list is not None and config.joint_attn_implementation != "three_way":
@@ -1039,6 +1040,22 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         # all downstream supertoken geometry automatically in sync with the pack.
         num_action_tokens_per_supertoken = packed_seq.num_action_tokens_per_supertoken
 
+        replicated_attention_io_cp = (
+            self.attention_io_layout == "replicated"
+            and self.parallel_dims is not None
+            and self.parallel_dims.cp_enabled
+        )
+        # ``sequence_sharded`` attention I/O shards the token sequence, so
+        # packing must pad sequence lengths to the CP size and the input/output
+        # sequence helpers need the CP mesh.  ``replicated`` attention I/O keeps
+        # current-frame sequences replicated and uses the CP mesh later inside
+        # attention to slice local heads, so the effective sequence-sharding
+        # world size is 1 here.
+        sequence_shard_parallel_dims = None if replicated_attention_io_cp else self.parallel_dims
+        sequence_shard_world_size = (
+            1 if replicated_attention_io_cp else (self.parallel_dims.cp_size if self.parallel_dims else 1)
+        )
+
         input_pack, attention_meta, natten_metadata_list = build_packed_sequence(
             self.config.joint_attn_implementation,
             packed_sequence=packed_sequence,
@@ -1053,7 +1070,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             num_layers=self.num_hidden_layers,
             token_shapes=packed_seq.vision.token_shapes,
             natten_parameter_list=self.natten_parameter_list,
-            cp_world_size=self.parallel_dims.cp_size if self.parallel_dims else 1,
+            cp_world_size=sequence_shard_world_size,
             video_temporal_causal=self.video_temporal_causal,
             skip_natten_metadata=memory is not None and not memory.requires_natten_metadata(),
             vision_token_shapes=vision_token_shapes,
@@ -1067,7 +1084,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             attn_implementation=self.config.joint_attn_implementation,
             input_pack=input_pack,
             position_ids=packed_seq.position_ids,
-            parallel_dims=self.parallel_dims,
+            parallel_dims=sequence_shard_parallel_dims,
         )
 
         packed_outputs, lbl_metadata = self.language_model(
@@ -1079,7 +1096,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         )
         last_hidden_state = get_context_parallel_last_hidden_state(
             packed_outputs=packed_outputs,
-            parallel_dims=self.parallel_dims,
+            parallel_dims=sequence_shard_parallel_dims,
         )  # [N_total,hidden_size]
         output_dict = dict()
 

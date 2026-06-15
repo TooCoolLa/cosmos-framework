@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.distributed import ProcessGroup
 
 from cosmos_framework.model.attention import attention as imaginaire_attention
 from cosmos_framework.model.attention.masks import CausalType
@@ -431,6 +432,21 @@ class Nemotron3DenseVLMoTConfig(_MoTConfigBase):
 # -----------------------------------------------------------------------------
 
 
+def _apply_head_sharded_o_proj(
+    local_attn_output: torch.Tensor,  # [N,H_local*D]
+    projection: nn.Linear,
+    feature_slice: slice,
+    cp_group: ProcessGroup,
+) -> torch.Tensor:  # [N,hidden_size]
+    """Apply one local input-column slice of ``projection`` and sum partial outputs."""
+    local_weight = projection.weight[:, feature_slice]  # [hidden_size,H_local*D]
+    out = torch.nn.functional.linear(local_attn_output, local_weight, bias=None)  # [N,hidden_size]
+    torch.distributed.all_reduce(out, op=torch.distributed.ReduceOp.SUM, group=cp_group)
+    if projection.bias is not None:
+        out = out + projection.bias  # [N,hidden_size]
+    return out
+
+
 class PackedAttentionMoT(nn.Module):
     """
     Dual-pathway packed attention for MoT architectures.
@@ -502,6 +518,36 @@ class PackedAttentionMoT(nn.Module):
 
         self._apply_rotary_pos_emb = layer_types.apply_rotary_pos_emb
         self.dispatch_attention_fn = dispatch_attention
+        self.replicated_attention_io_local_head_o_proj = False
+        self.replicated_attention_io_cp_mesh: Any | None = None
+
+    def _replicated_attention_io_q_feature_slice(self) -> slice:
+        cp_mesh = self.replicated_attention_io_cp_mesh
+        assert cp_mesh is not None, "replicated attention I/O requires a CP mesh"
+        cp_group = cp_mesh.get_group()
+        cp_rank = torch.distributed.get_rank(cp_group)
+        cp_size = torch.distributed.get_world_size(cp_group)
+        assert self.num_key_value_heads % cp_size == 0, (
+            f"cp_size({cp_size}) must divide num_key_value_heads({self.num_key_value_heads})"
+        )
+        assert self.num_attention_heads % self.num_key_value_heads == 0, (
+            f"num_attention_heads({self.num_attention_heads}) must be divisible by "
+            f"num_key_value_heads({self.num_key_value_heads})"
+        )
+        kv_heads_per_rank = self.num_key_value_heads // cp_size
+        q_heads_per_kv_head = self.num_attention_heads // self.num_key_value_heads
+        q_heads_per_rank = kv_heads_per_rank * q_heads_per_kv_head
+        q_start = cp_rank * q_heads_per_rank
+        q_end = q_start + q_heads_per_rank
+        return slice(q_start * self.head_dim, q_end * self.head_dim)
+
+    def _uses_replicated_attention_io_local_head_o_proj(self, memory_value: MemoryValue | None) -> bool:
+        return (
+            self.replicated_attention_io_local_head_o_proj
+            and memory_value is not None
+            and getattr(memory_value, "frame_idx", 0) > 0
+            and not getattr(memory_value, "for_cuda_graphs", False)
+        )
 
     def forward(
         self,
@@ -587,7 +633,7 @@ class PackedAttentionMoT(nn.Module):
 
         # Produce kv_to_store for MemoryState.write_for_layer() when the
         # dispatch didn't already provide one (e.g. standard or AR frame-0
-        # non-CP paths).  CP dispatch returns head-sharded kv_to_store
+        # non-CP paths).  CP dispatch returns local KV-head kv_to_store
         # directly, so kv_to_store is already non-None in that case.
         #
         # Gradient detach is NOT done here; each MemoryState.write_for_layer()
@@ -603,9 +649,39 @@ class PackedAttentionMoT(nn.Module):
                 v_und[:und_len].unsqueeze(0),
             )
 
-        # Apply projections directly to get final results
-        und_seq = self.o_proj(get_und_seq(packed_attn_output))  # [N_und,hidden_size]
-        gen_seq = self.o_proj_moe_gen(get_gen_seq(packed_attn_output))  # [N_gen,hidden_size]
+        # Attention compute is local-head under both sequence-sharded and
+        # replicated attention I/O layouts.  The difference here is the output
+        # layout returned to this module.  Replicated attention I/O returns only
+        # this rank's local heads from AR frame 1+ attention:
+        # gen [N_gen,H_local*D] and und [0,H_local*D].  We therefore apply the
+        # matching o_proj input-column slice and all-reduce partial outputs back
+        # to replicated hidden states.  The else path receives full attention
+        # heads at this boundary, so regular o_proj applies:
+        # und [N_und,H*D] -> [N_und,hidden_size],
+        # gen [N_gen,H*D] -> [N_gen,hidden_size].
+        if self._uses_replicated_attention_io_local_head_o_proj(memory_value):
+            local_und_attn = get_und_seq(packed_attn_output)  # [0,H_local*D]
+            local_gen_attn = get_gen_seq(packed_attn_output)  # [N_gen,H_local*D]
+            assert local_und_attn.shape[0] == 0, "replicated attention I/O only supports gen-only frame 1+ attention"
+            feature_slice = self._replicated_attention_io_q_feature_slice()
+            assert feature_slice.start is not None and feature_slice.stop is not None
+            expected_local_features = feature_slice.stop - feature_slice.start
+            assert local_gen_attn.shape[-1] == expected_local_features, (
+                f"Expected local attention features {expected_local_features}, got {local_gen_attn.shape[-1]}"
+            )
+            cp_mesh = self.replicated_attention_io_cp_mesh
+            assert cp_mesh is not None, "replicated attention I/O requires a CP mesh"
+            cp_group = cp_mesh.get_group()
+            und_seq = local_gen_attn.new_empty((0, self.hidden_size))  # [0,hidden_size]
+            gen_seq = _apply_head_sharded_o_proj(
+                local_gen_attn,
+                self.o_proj_moe_gen,
+                feature_slice,
+                cp_group,
+            )  # [N_gen,hidden_size]
+        else:
+            und_seq = self.o_proj(get_und_seq(packed_attn_output))  # [N_und,hidden_size]
+            gen_seq = self.o_proj_moe_gen(get_gen_seq(packed_attn_output))  # [N_gen,hidden_size]
         return from_und_gen_splits(und_seq, gen_seq, pack), kv_to_store  # [N_und+N_gen,hidden_size]
 
     def reasoner_forward(
