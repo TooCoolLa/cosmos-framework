@@ -102,7 +102,7 @@ class ActionBaseDataset(ABC, Dataset):
         return self._domain_id
 
     @property
-    def action_normalization(self) -> str:
+    def action_normalization(self) -> str | None:
         return self._action_normalization
 
     @property
@@ -186,7 +186,12 @@ class ActionBaseDataset(ABC, Dataset):
         **extras: Any,
     ) -> dict[str, Any]:
         idle_frames = self._compute_idle_frames(action)
-        normalized_action = normalize_action(action, self.action_normalization, self._load_norm_stats())
+        # action_normalization=None means "raw / un-normalized" (e.g. DROID
+        # joint_pos): pass actions through untouched and skip loading stats.
+        if self.action_normalization is None:
+            normalized_action = action
+        else:
+            normalized_action = normalize_action(action, self.action_normalization, self._load_norm_stats())
         formatted_video = (video * 255.0).clamp(0.0, 255.0).to(torch.uint8).permute(1, 0, 2, 3)
         return {
             "ai_caption": ai_caption,
