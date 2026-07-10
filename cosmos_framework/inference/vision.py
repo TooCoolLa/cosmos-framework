@@ -14,6 +14,9 @@ from PIL import Image
 from cosmos_framework.data.generator.sequence_packing import SequencePlan
 from cosmos_framework.data.generator.utils import VIDEO_RES_SIZE_INFO
 
+_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+
 
 def resize_pil_image(image: Image.Image, max_size: int, padding_constant: int) -> Image.Image:
     """Resize a PIL image so the max side length is at most *max_size* and both
@@ -88,9 +91,37 @@ def load_conditioning_video(
 
     ``keep`` selects which ``max_frames`` to take when the input is longer.
     """
-    frames, _, _ = torchvision.io.read_video(str(video_path), pts_unit="sec")
-    frames = frames[-max_frames:] if keep == "last" else frames[:max_frames]  # [T,H,W,3]
-    frames_tchw = frames.permute(0, 3, 1, 2).float()  # [T,3,H,W]
+    is_pattern = "*" in video_path.name or "?" in video_path.name
+    if video_path.is_dir() or is_pattern:
+        if is_pattern:
+            img_paths = sorted(list(video_path.parent.glob(video_path.name)))
+        else:
+            img_paths = sorted([
+                p for p in video_path.iterdir()
+                if p.suffix.lower() in _IMAGE_EXTENSIONS
+            ])
+            
+        if not img_paths:
+            raise ValueError(f"No matching images found for path: {video_path}")
+            
+        img_paths = img_paths[-max_frames:] if keep == "last" else img_paths[:max_frames]
+        frames_list = []
+        ref_size = None
+        for img_p in img_paths:
+            with img_p.open("rb") as f:
+                img = Image.open(f).convert("RGB")
+            if ref_size is None:
+                ref_size = img.size
+            elif img.size != ref_size:
+                img = img.resize(ref_size, Image.LANCZOS)
+            frames_list.append(torch.from_numpy(np.array(img)))
+        frames = torch.stack(frames_list, dim=0).float()
+    else:
+        frames, _, _ = torchvision.io.read_video(str(video_path), pts_unit="sec")
+        frames = frames[-max_frames:] if keep == "last" else frames[:max_frames]  # [T,H,W,3]
+        frames = frames.float()
+
+    frames_tchw = frames.permute(0, 3, 1, 2)  # [T,3,H,W]
     frames_resized = _resize_and_center_crop(frames_tchw, target_h, target_w)  # [T,3,target_h,target_w]
     frames_normalized = frames_resized / 127.5 - 1.0  # [T,3,target_h,target_w]
     return frames_normalized.permute(1, 0, 2, 3)  # [3,T,target_h,target_w]
@@ -163,10 +194,6 @@ def build_image_edit_batch(
     }
 
 
-_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
-_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
-
-
 def detect_aspect_ratio(width: int, height: int) -> str:
     """Return the closest supported aspect-ratio key for a frame size."""
     aspect_ratios = np.array([16 / 9, 4 / 3, 1, 3 / 4, 9 / 16])
@@ -177,6 +204,34 @@ def detect_aspect_ratio(width: int, height: int) -> str:
 
 def read_media_frames(path: Path, max_frames: int) -> tuple[torch.Tensor, float]:
     """Read an image or video into a uint8 tensor of shape (C, T, H, W)."""
+    is_pattern = "*" in path.name or "?" in path.name
+    if path.is_dir() or is_pattern:
+        if is_pattern:
+            img_paths = sorted(list(path.parent.glob(path.name)))
+        else:
+            img_paths = sorted([
+                p for p in path.iterdir()
+                if p.suffix.lower() in _IMAGE_EXTENSIONS
+            ])
+            
+        if not img_paths:
+            raise ValueError(f"No matching images found for path: {path}")
+            
+        img_paths = img_paths[:max_frames]
+        frames_list = []
+        ref_size = None
+        for img_p in img_paths:
+            with img_p.open("rb") as f:
+                img = Image.open(f).convert("RGB")
+            if ref_size is None:
+                ref_size = img.size
+            elif img.size != ref_size:
+                img = img.resize(ref_size, Image.LANCZOS)
+            img_t = torch.from_numpy(np.array(img)).permute(2, 0, 1)
+            frames_list.append(img_t)
+        frames = torch.stack(frames_list, dim=1)
+        return frames, 24.0
+
     ext = path.suffix.lower()
     if ext in _IMAGE_EXTENSIONS:
         with path.open("rb") as f:

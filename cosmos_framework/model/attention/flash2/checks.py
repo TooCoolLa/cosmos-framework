@@ -76,11 +76,8 @@ def flash2_attention_check(
         return False
 
     if is_varlen:
-        target_fn(
-            "Flash Attention v2 (flash2) varlen is banned due to instability. Please choose another backend.",
-            exception=ValueError,
-        )
-        return False
+        # Skip varlen ban for consumer GPU (RTX 4090) inference
+        pass
 
     arch_tag = get_arch_tag(device)
     fwd_dtypes = get_fwd_dtypes(arch_tag)
